@@ -12,7 +12,7 @@ struct Args {
     mode: String,
 
     #[arg(default_value_t = 8)]
-    update_count: usize,
+    committee_transitions: usize,
 
     #[arg(default_value_t = 0)]
     initial_slot: u64,
@@ -34,7 +34,7 @@ async fn main() -> anyhow::Result<()> {
     run(&BenchmarkArgs {
         spec_name: &args.spec,
         mode: parse_mode(&args.mode),
-        update_count: args.update_count,
+        committee_transitions: args.committee_transitions,
         initial_slot: args.initial_slot,
         signers_per_update: args.signers_per_update,
         runs: args.runs,

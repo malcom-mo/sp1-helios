@@ -33,7 +33,7 @@ use tree_hash::TreeHash;
 pub struct BenchmarkArgs<'a> {
     pub spec_name: &'a str,
     pub mode: BenchmarkMode,
-    pub update_count: usize,
+    pub committee_transitions: usize,
     pub initial_slot: u64,
     pub signers_per_update: usize,
     pub runs: usize,
@@ -66,7 +66,7 @@ async fn run_for_spec<S: BenchmarkSpecBinding>(args: &BenchmarkArgs<'_>) -> Resu
     let fixture = generate_fixture::<S>(&SyntheticFixtureConfig {
         mode: args.mode,
         initial_slot: args.initial_slot,
-        update_count: args.update_count,
+        committee_transitions: args.committee_transitions,
         signers_per_update: effective_signers,
         genesis_root: B256::repeat_byte(7),
         forks: default_benchmark_forks(),
@@ -133,7 +133,7 @@ async fn run_for_spec<S: BenchmarkSpecBinding>(args: &BenchmarkArgs<'_>) -> Resu
         args.mode,
         benchmark_committee_size(args.mode, args.spec_name),
         args.initial_slot,
-        args.update_count,
+        args.committee_transitions,
         effective_signers,
         args.runs,
         fixture_elapsed.as_micros(),
@@ -214,7 +214,7 @@ fn append_csv(
     mode: BenchmarkMode,
     committee_size: usize,
     initial_slot: u64,
-    update_count: usize,
+    committee_transitions: usize,
     signers_per_update: usize,
     runs: usize,
     fixture_us: u128,
@@ -234,7 +234,7 @@ fn append_csv(
     if !has_rows {
         writeln!(
             file,
-            "timestamp,spec,mode,committee_size,initial_slot,effective_signers_per_update,update_count,runs,fixture_us,setup_us,prove_min_us,prove_max_us,prove_avg_us,verify_min_us,verify_max_us,verify_avg_us,prev_head,new_head,updates_processed,vkey"
+            "timestamp,spec,mode,committee_size,initial_slot,effective_signers_per_update,committee_transitions,runs,fixture_us,setup_us,prove_min_us,prove_max_us,prove_avg_us,verify_min_us,verify_max_us,verify_avg_us,prev_head,new_head,updates_processed,vkey"
         )?;
     }
 
@@ -250,7 +250,7 @@ fn append_csv(
         committee_size,
         initial_slot,
         signers_per_update,
-        update_count,
+        committee_transitions,
         runs,
         fixture_us,
         setup_us,

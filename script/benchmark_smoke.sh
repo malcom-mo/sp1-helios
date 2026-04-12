@@ -18,6 +18,8 @@ mkdir -p "$OUT_DIR"
 
 cargo build --release -p sp1-helios-script --bin benchmark --manifest-path "$ROOT_DIR/Cargo.toml"
 
+# Arguments are:
+#   <spec> <mode> <committee_transitions> <initial_slot> <signers_per_update> <runs> <output>
 "$BIN_PATH" minimal strict 1 0 22 1 "$OUT_DIR/minimal-strict.csv"
 "$BIN_PATH" minimal simplified 1 0 999 1 "$OUT_DIR/minimal-simplified.csv"
 "$BIN_PATH" minimal strict 4 61 22 1 "$OUT_DIR/minimal-strict-rotate.csv"
