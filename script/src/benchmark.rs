@@ -90,6 +90,7 @@ async fn run_for_spec<S: BenchmarkSpecBinding>(args: &BenchmarkArgs<'_>) -> Resu
         .await
         .context("failed to set up synthetic benchmark program")?;
     let setup_elapsed = setup_started.elapsed();
+    let proof_mode = selected_proof_mode();
 
     let mut prove_times = Vec::with_capacity(args.runs);
     let mut last_proof = None;
@@ -99,9 +100,7 @@ async fn run_for_spec<S: BenchmarkSpecBinding>(args: &BenchmarkArgs<'_>) -> Resu
         stdin.write_slice(&encoded_inputs);
 
         let prove_started = Instant::now();
-        let proof = client
-            .prove(&pk, stdin)
-            .plonk()
+        let proof = prove_synthetic_update(&client, &pk, stdin, proof_mode)
             .await
             .context("synthetic update proof failed")?;
         prove_times.push(prove_started.elapsed().as_micros());
@@ -142,6 +141,31 @@ async fn run_for_spec<S: BenchmarkSpecBinding>(args: &BenchmarkArgs<'_>) -> Resu
     )?;
 
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SyntheticProofMode {
+    Core,
+    Plonk,
+}
+
+fn selected_proof_mode() -> SyntheticProofMode {
+    match std::env::var("SP1_PROVER").ok().as_deref() {
+        Some("mock" | "light") => SyntheticProofMode::Core,
+        _ => SyntheticProofMode::Plonk,
+    }
+}
+
+async fn prove_synthetic_update<P: Prover>(
+    client: &P,
+    pk: &P::ProvingKey,
+    stdin: SP1Stdin,
+    proof_mode: SyntheticProofMode,
+) -> Result<SP1ProofWithPublicValues, P::Error> {
+    match proof_mode {
+        SyntheticProofMode::Core => client.prove(pk, stdin).core().await,
+        SyntheticProofMode::Plonk => client.prove(pk, stdin).plonk().await,
+    }
 }
 
 fn expected_outputs<S: ConsensusSpec>(
