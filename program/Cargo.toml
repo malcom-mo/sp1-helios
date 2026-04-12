@@ -18,7 +18,7 @@ name = "synthetic_update"
 path = "src/synthetic_update.rs"
 
 [dependencies]
-sp1-zkvm = "5.2.1"
+sp1-zkvm = "6.1.0"
 helios-consensus-core = { workspace = true }
 serde_cbor = { workspace = true }
 sp1-helios-primitives = { workspace = true }

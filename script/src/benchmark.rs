@@ -23,7 +23,10 @@ use sp1_helios_primitives::types::{
     SimplifiedMinimalSyntheticBenchmarkFixture, SimplifiedMinimalSyntheticBenchmarkStep,
     SyntheticBenchmarkMode, SyntheticBenchmarkSpec, SyntheticProofInputs, SyntheticProofOutputs,
 };
-use sp1_sdk::{HashableKey, ProverClient, SP1ProofWithPublicValues, SP1Stdin};
+use sp1_sdk::{
+    Elf, HashableKey, ProveRequest, Prover, ProverClient, ProvingKey,
+    SP1ProofWithPublicValues, SP1Stdin,
+};
 use tree_hash::TreeHash;
 
 #[derive(Debug, Clone)]
@@ -37,25 +40,25 @@ pub struct BenchmarkArgs<'a> {
     pub output: &'a Path,
 }
 
-pub fn run(args: &BenchmarkArgs<'_>) -> Result<()> {
+pub async fn run(args: &BenchmarkArgs<'_>) -> Result<()> {
     match (args.spec_name, args.mode) {
         ("minimal", BenchmarkMode::Strict) => {
-            run_for_spec::<MinimalConsensusSpec>(args)
+            run_for_spec::<MinimalConsensusSpec>(args).await
         }
         ("minimal", BenchmarkMode::Simplified) => {
-            run_for_spec::<SimplifiedMinimalConsensusSpec>(args)
+            run_for_spec::<SimplifiedMinimalConsensusSpec>(args).await
         }
         ("mainnet", BenchmarkMode::Strict) => {
-            run_for_spec::<MainnetConsensusSpec>(args)
+            run_for_spec::<MainnetConsensusSpec>(args).await
         }
         ("mainnet", BenchmarkMode::Simplified) => {
-            run_for_spec::<SimplifiedMainnetConsensusSpec>(args)
+            run_for_spec::<SimplifiedMainnetConsensusSpec>(args).await
         }
         _ => anyhow::bail!("spec must be one of: minimal, mainnet"),
     }
 }
 
-fn run_for_spec<S: BenchmarkSpecBinding>(args: &BenchmarkArgs<'_>) -> Result<()> {
+async fn run_for_spec<S: BenchmarkSpecBinding>(args: &BenchmarkArgs<'_>) -> Result<()> {
     let effective_signers =
         benchmark_signers_per_update(args.mode, args.spec_name, args.signers_per_update);
 
@@ -78,11 +81,14 @@ fn run_for_spec<S: BenchmarkSpecBinding>(args: &BenchmarkArgs<'_>) -> Result<()>
     let encoded_inputs = serde_cbor::to_vec(&S::wrap_input(fixture.clone()))
         .context("failed to encode synthetic proof inputs")?;
 
-    let client = ProverClient::from_env();
+    let client = ProverClient::from_env().await;
     let elf = load_synthetic_update_elf()?;
 
     let setup_started = Instant::now();
-    let (pk, vk) = client.setup(&elf);
+    let pk = client
+        .setup(Elf::from(elf))
+        .await
+        .context("failed to set up synthetic benchmark program")?;
     let setup_elapsed = setup_started.elapsed();
 
     let mut prove_times = Vec::with_capacity(args.runs);
@@ -94,9 +100,9 @@ fn run_for_spec<S: BenchmarkSpecBinding>(args: &BenchmarkArgs<'_>) -> Result<()>
 
         let prove_started = Instant::now();
         let proof = client
-            .prove(&pk, &stdin)
+            .prove(&pk, stdin)
             .plonk()
-            .run()
+            .await
             .context("synthetic update proof failed")?;
         prove_times.push(prove_started.elapsed().as_micros());
         last_proof = Some(proof);
@@ -113,7 +119,7 @@ fn run_for_spec<S: BenchmarkSpecBinding>(args: &BenchmarkArgs<'_>) -> Result<()>
     for _ in 0..args.runs {
         let verify_started = Instant::now();
         client
-            .verify(&proof, &vk)
+            .verify(&proof, pk.verifying_key(), None)
             .context("synthetic update proof verification failed")?;
         verify_times.push(verify_started.elapsed().as_micros());
     }
@@ -132,7 +138,7 @@ fn run_for_spec<S: BenchmarkSpecBinding>(args: &BenchmarkArgs<'_>) -> Result<()>
         stats(&prove_times),
         stats(&verify_times),
         &public_values,
-        vk.bytes32().to_string(),
+        pk.verifying_key().bytes32(),
     )?;
 
     Ok(())

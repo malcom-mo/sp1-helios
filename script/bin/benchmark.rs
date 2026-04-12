@@ -27,7 +27,8 @@ struct Args {
     output: PathBuf,
 }
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     run(&BenchmarkArgs {
@@ -39,4 +40,5 @@ fn main() -> anyhow::Result<()> {
         runs: args.runs,
         output: &args.output,
     })
+    .await
 }
