@@ -115,12 +115,16 @@ async fn run_for_spec<S: BenchmarkSpecBinding>(args: &BenchmarkArgs<'_>) -> Resu
     );
 
     let mut verify_times = Vec::with_capacity(args.runs);
-    for _ in 0..args.runs {
-        let verify_started = Instant::now();
-        client
-            .verify(&proof, pk.verifying_key(), None)
-            .context("synthetic update proof verification failed")?;
-        verify_times.push(verify_started.elapsed().as_micros());
+    if proof_mode.requires_verification() {
+        for _ in 0..args.runs {
+            let verify_started = Instant::now();
+            client
+                .verify(&proof, pk.verifying_key(), None)
+                .context("synthetic update proof verification failed")?;
+            verify_times.push(verify_started.elapsed().as_micros());
+        }
+    } else {
+        verify_times.resize(args.runs, 0);
     }
 
     append_csv(
@@ -147,6 +151,12 @@ async fn run_for_spec<S: BenchmarkSpecBinding>(args: &BenchmarkArgs<'_>) -> Resu
 enum SyntheticProofMode {
     Core,
     Plonk,
+}
+
+impl SyntheticProofMode {
+    fn requires_verification(self) -> bool {
+        matches!(self, Self::Plonk)
+    }
 }
 
 fn selected_proof_mode() -> SyntheticProofMode {
