@@ -17,6 +17,10 @@ path = "./bin/operator.rs"
 name = "vkey"
 path = "./bin/vkey.rs"
 
+[[bin]]
+name = "benchmark"
+path = "./bin/benchmark.rs"
+
 [dependencies]
 dotenv = { workspace = true }
 sp1-sdk = { workspace = true }

@@ -13,6 +13,10 @@ path = "src/light_client.rs"
 name = "storage"
 path = "src/storage.rs"
 
+[[bin]]
+name = "synthetic_update"
+path = "src/synthetic_update.rs"
+
 [dependencies]
 sp1-zkvm = "5.2.1"
 helios-consensus-core = { workspace = true }

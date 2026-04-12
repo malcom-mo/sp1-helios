@@ -16,6 +16,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc::channel, watch};
 use tree_hash::TreeHash;
 
+pub mod benchmark;
 pub mod handle;
 pub mod operator;
 

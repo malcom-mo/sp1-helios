@@ -3,9 +3,10 @@
 use alloy_primitives::{Address, Bytes, B256, U256};
 use alloy_sol_types::sol;
 use alloy_trie::TrieAccount;
-use helios_consensus_core::consensus_spec::MainnetConsensusSpec;
+use helios_consensus_core::benchmark::{SimplifiedMainnetConsensusSpec, SimplifiedMinimalConsensusSpec};
+use helios_consensus_core::consensus_spec::{MainnetConsensusSpec, MinimalConsensusSpec};
 use helios_consensus_core::types::Forks;
-use helios_consensus_core::types::{FinalityUpdate, LightClientStore, Update};
+use helios_consensus_core::types::{FinalityUpdate, GenericUpdate, LightClientStore, Update};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -17,6 +18,82 @@ pub struct ProofInputs {
     pub genesis_root: B256,
     pub forks: Forks,
     pub contract_storage: Vec<ContractStorage>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyntheticBenchmarkMode {
+    Strict,
+    Simplified,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyntheticBenchmarkSpec {
+    Minimal,
+    Mainnet,
+}
+
+macro_rules! define_synthetic_fixture_types {
+    ($step:ident, $fixture:ident, $spec:ty) => {
+        #[derive(Serialize, Deserialize, Debug, Clone)]
+        #[serde(bound = "")]
+        pub struct $step {
+            pub current_slot: u64,
+            pub update: GenericUpdate<$spec>,
+        }
+
+        #[derive(Serialize, Deserialize, Debug, Clone)]
+        #[serde(bound = "")]
+        pub struct $fixture {
+            pub mode: SyntheticBenchmarkMode,
+            pub genesis_root: B256,
+            pub forks: Forks,
+            pub store: LightClientStore<$spec>,
+            pub steps: Vec<$step>,
+        }
+    };
+}
+
+define_synthetic_fixture_types!(
+    MinimalSyntheticBenchmarkStep,
+    MinimalSyntheticBenchmarkFixture,
+    MinimalConsensusSpec
+);
+define_synthetic_fixture_types!(
+    MainnetSyntheticBenchmarkStep,
+    MainnetSyntheticBenchmarkFixture,
+    MainnetConsensusSpec
+);
+define_synthetic_fixture_types!(
+    SimplifiedMinimalSyntheticBenchmarkStep,
+    SimplifiedMinimalSyntheticBenchmarkFixture,
+    SimplifiedMinimalConsensusSpec
+);
+define_synthetic_fixture_types!(
+    SimplifiedMainnetSyntheticBenchmarkStep,
+    SimplifiedMainnetSyntheticBenchmarkFixture,
+    SimplifiedMainnetConsensusSpec
+);
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum SyntheticProofInputs {
+    MinimalStrict(MinimalSyntheticBenchmarkFixture),
+    MainnetStrict(MainnetSyntheticBenchmarkFixture),
+    MinimalSimplified(SimplifiedMinimalSyntheticBenchmarkFixture),
+    MainnetSimplified(SimplifiedMainnetSyntheticBenchmarkFixture),
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SyntheticProofOutputs {
+    pub mode: SyntheticBenchmarkMode,
+    pub spec: SyntheticBenchmarkSpec,
+    pub updates_processed: usize,
+    pub prev_header: B256,
+    pub prev_head: u64,
+    pub prev_sync_committee_hash: B256,
+    pub new_header: B256,
+    pub new_head: u64,
+    pub sync_committee_hash: B256,
+    pub next_sync_committee_hash: B256,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
