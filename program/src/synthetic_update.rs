@@ -3,7 +3,7 @@ sp1_zkvm::entrypoint!(main);
 
 use alloy_primitives::B256;
 use helios_consensus_core::{
-    benchmark::{BenchmarkFixture, BenchmarkMode, BenchmarkStep, run_update_benchmark},
+    benchmark::{BenchmarkFixture, BenchmarkMode, BenchmarkStep, execute_update_benchmark},
     consensus_spec::ConsensusSpec,
 };
 use sp1_helios_primitives::types::{
@@ -140,7 +140,7 @@ fn run_fixture_inner<S: ConsensusSpec>(
         steps,
     };
 
-    let run = run_update_benchmark(&benchmark_fixture).expect("synthetic benchmark run failed");
+    let run = execute_update_benchmark(&benchmark_fixture).expect("synthetic benchmark run failed");
     let store = run.store;
 
     SyntheticProofOutputs {
