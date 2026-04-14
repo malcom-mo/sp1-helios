@@ -24,7 +24,7 @@ use sp1_helios_primitives::types::{
     SyntheticBenchmarkMode, SyntheticBenchmarkSpec, SyntheticProofInputs, SyntheticProofOutputs,
 };
 use sp1_sdk::{
-    Elf, HashableKey, ProveRequest, Prover, ProverClient, ProvingKey,
+    Elf, ProveRequest, Prover, ProverClient, ProvingKey,
     SP1ProofWithPublicValues, SP1Stdin,
 };
 use tree_hash::TreeHash;
@@ -127,6 +127,13 @@ async fn run_for_spec<S: BenchmarkSpecBinding>(args: &BenchmarkArgs<'_>) -> Resu
         verify_times.resize(args.runs, 0);
     }
 
+    // .bytes() is only valid for Plonk/Groth16 proofs; Core (mock) proofs have no onchain encoding.
+    let proof_bytes = if proof_mode.requires_verification() {
+        proof.bytes().len()
+    } else {
+        0
+    };
+
     append_csv(
         args.output,
         args.spec_name,
@@ -138,10 +145,10 @@ async fn run_for_spec<S: BenchmarkSpecBinding>(args: &BenchmarkArgs<'_>) -> Resu
         args.runs,
         fixture_elapsed.as_micros(),
         setup_elapsed.as_micros(),
-        stats(&prove_times),
-        stats(&verify_times),
+        avg(&prove_times),
+        avg(&verify_times),
         &public_values,
-        pk.verifying_key().bytes32(),
+        proof_bytes,
     )?;
 
     Ok(())
@@ -219,10 +226,10 @@ fn append_csv(
     runs: usize,
     fixture_us: u128,
     setup_us: u128,
-    prove_stats: (u128, u128, f64),
-    verify_stats: (u128, u128, f64),
+    prove_avg_us: f64,
+    verify_avg_us: f64,
     public_values: &SyntheticProofOutputs,
-    vkey: String,
+    proof_bytes: usize,
 ) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         create_dir_all(parent)?;
@@ -234,13 +241,13 @@ fn append_csv(
     if !has_rows {
         writeln!(
             file,
-            "timestamp,spec,mode,committee_size,initial_slot,effective_signers_per_update,committee_transitions,runs,fixture_us,setup_us,prove_min_us,prove_max_us,prove_avg_us,verify_min_us,verify_max_us,verify_avg_us,prev_head,new_head,updates_processed,vkey"
+            "timestamp,spec,mode,committee_size,initial_slot,effective_signers_per_update,committee_transitions,runs,fixture_us,setup_us,prove_avg_us,verify_avg_us,prev_head,new_head,updates_processed,proof_bytes"
         )?;
     }
 
     writeln!(
         file,
-        "{},{},{},{},{},{},{},{},{},{},{},{},{:.2},{},{},{:.2},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{:.2},{:.2},{},{},{},{}",
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -254,16 +261,12 @@ fn append_csv(
         runs,
         fixture_us,
         setup_us,
-        prove_stats.0,
-        prove_stats.1,
-        prove_stats.2,
-        verify_stats.0,
-        verify_stats.1,
-        verify_stats.2,
+        prove_avg_us,
+        verify_avg_us,
         public_values.prev_head,
         public_values.new_head,
         public_values.updates_processed,
-        vkey,
+        proof_bytes,
     )?;
 
     Ok(())
@@ -277,15 +280,12 @@ fn load_synthetic_update_elf() -> Result<Vec<u8>> {
     read(&path).with_context(|| format!("failed to read synthetic benchmark ELF at {}", path.display()))
 }
 
-fn stats(values: &[u128]) -> (u128, u128, f64) {
-    let min = *values.iter().min().unwrap_or(&0);
-    let max = *values.iter().max().unwrap_or(&0);
-    let avg = if values.is_empty() {
+fn avg(values: &[u128]) -> f64 {
+    if values.is_empty() {
         0.0
     } else {
         values.iter().sum::<u128>() as f64 / values.len() as f64
-    };
-    (min, max, avg)
+    }
 }
 
 pub fn parse_mode(mode: &str) -> BenchmarkMode {
