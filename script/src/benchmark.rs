@@ -1,6 +1,5 @@
 use std::{
     fs::{OpenOptions, create_dir_all, metadata, read},
-    io::Write,
     path::{Path, PathBuf},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
@@ -236,38 +235,38 @@ fn append_csv(
     }
 
     let has_rows = metadata(path).map(|m| m.len() > 0).unwrap_or(false);
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    let file = OpenOptions::new().create(true).append(true).open(path)?;
+    let mut wtr = csv::WriterBuilder::new().has_headers(false).from_writer(file);
 
     if !has_rows {
-        writeln!(
-            file,
-            "timestamp,spec,mode,committee_size,initial_slot,effective_signers_per_update,committee_transitions,runs,fixture_us,setup_us,prove_avg_us,verify_avg_us,prev_head,new_head,updates_processed,proof_bytes"
-        )?;
+        wtr.write_record(&[
+            "timestamp", "spec", "mode", "committee_size", "initial_slot",
+            "effective_signers_per_update", "committee_transitions", "runs",
+            "fixture_us", "setup_us", "prove_avg_us", "verify_avg_us",
+            "prev_head", "new_head", "updates_processed", "proof_bytes",
+        ])?;
     }
 
-    writeln!(
-        file,
-        "{},{},{},{},{},{},{},{},{},{},{:.2},{:.2},{},{},{},{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis(),
-        spec_name,
-        mode_label(mode),
-        committee_size,
-        initial_slot,
-        signers_per_update,
-        committee_transitions,
-        runs,
-        fixture_us,
-        setup_us,
-        prove_avg_us,
-        verify_avg_us,
-        public_values.prev_head,
-        public_values.new_head,
-        public_values.updates_processed,
-        proof_bytes,
-    )?;
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
+    wtr.write_record(&[
+        ts.to_string(),
+        spec_name.to_string(),
+        mode_label(mode).to_string(),
+        committee_size.to_string(),
+        initial_slot.to_string(),
+        signers_per_update.to_string(),
+        committee_transitions.to_string(),
+        runs.to_string(),
+        fixture_us.to_string(),
+        setup_us.to_string(),
+        format!("{prove_avg_us:.2}"),
+        format!("{verify_avg_us:.2}"),
+        public_values.prev_head.to_string(),
+        public_values.new_head.to_string(),
+        public_values.updates_processed.to_string(),
+        proof_bytes.to_string(),
+    ])?;
+    wtr.flush()?;
 
     Ok(())
 }
