@@ -1,6 +1,7 @@
 use std::{
     fs::{OpenOptions, create_dir_all, metadata, read},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -27,6 +28,14 @@ use sp1_sdk::{
     SP1ProofWithPublicValues, SP1Stdin,
 };
 use tree_hash::TreeHash;
+use tracing::span;
+use tracing_subscriber::{
+    EnvFilter, Layer, Registry,
+    fmt::format::FmtSpan,
+    layer::{Context as LayerContext, SubscriberExt},
+    registry::LookupSpan,
+    util::SubscriberInitExt,
+};
 
 #[derive(Debug, Clone)]
 pub struct BenchmarkArgs<'a> {
@@ -58,6 +67,8 @@ pub async fn run(args: &BenchmarkArgs<'_>) -> Result<()> {
 }
 
 async fn run_for_spec<S: BenchmarkSpecBinding>(args: &BenchmarkArgs<'_>) -> Result<()> {
+    let prove_span_times = init_tracing_once();
+
     let effective_signers =
         benchmark_signers_per_update(args.mode, args.spec_name, args.signers_per_update);
 
@@ -85,14 +96,30 @@ async fn run_for_spec<S: BenchmarkSpecBinding>(args: &BenchmarkArgs<'_>) -> Resu
 
     let setup_started = Instant::now();
     let pk = client
-        .setup(Elf::from(elf))
+        .setup(Elf::from(elf.clone()))
         .await
         .context("failed to set up synthetic benchmark program")?;
     let setup_elapsed = setup_started.elapsed();
     let proof_mode = selected_proof_mode();
 
+    // Deterministic execution metrics via execute() — no proof generation, fast.
+    // Placed outside the prove timing loop so it never contaminates wall-clock measurements.
+    let execute_started = Instant::now();
+    let mut exec_stdin = SP1Stdin::new();
+    exec_stdin.write_slice(&encoded_inputs);
+    let (_exec_pv, exec_report) = client
+        .execute(Elf::from(elf.clone()), exec_stdin)
+        .await
+        .context("execute() for metrics collection failed")?;
+    let execute_elapsed = execute_started.elapsed();
+    let total_instructions = exec_report.total_instruction_count();
+    let gas = exec_report.gas().unwrap_or(0);
+
     let mut prove_times = Vec::with_capacity(args.runs);
     let mut last_proof = None;
+
+    // Clear any span timings that may have accumulated before the timed loop.
+    prove_span_times.lock().unwrap().clear();
 
     for _ in 0..args.runs {
         let mut stdin = SP1Stdin::new();
@@ -105,6 +132,9 @@ async fn run_for_spec<S: BenchmarkSpecBinding>(args: &BenchmarkArgs<'_>) -> Resu
         prove_times.push(prove_started.elapsed().as_micros());
         last_proof = Some(proof);
     }
+
+    let sp1_span_vec: Vec<u128> = prove_span_times.lock().unwrap().clone();
+    let sp1_prove_span_avg_us = avg(&sp1_span_vec);
 
     let proof = last_proof.expect("runs must be greater than zero");
     let public_values = decode_public_values(&proof)?;
@@ -148,10 +178,83 @@ async fn run_for_spec<S: BenchmarkSpecBinding>(args: &BenchmarkArgs<'_>) -> Resu
         avg(&verify_times),
         &public_values,
         proof_bytes,
+        total_instructions,
+        gas,
+        execute_elapsed.as_micros(),
+        sp1_prove_span_avg_us,
     )?;
 
     Ok(())
 }
+
+// ── SP1 prove-span capture ────────────────────────────────────────────────────
+
+/// Marker stored in span extensions to record the wall-clock start time.
+struct SpanStart(Instant);
+
+/// Tracing layer that records the wall-clock duration of SP1's internal `prove`
+/// span into a shared Vec. One entry is pushed per `prove()` call.
+struct ProveSpanCapture {
+    times: Arc<Mutex<Vec<u128>>>,
+}
+
+impl<S: tracing::Subscriber + for<'a> LookupSpan<'a>> Layer<S> for ProveSpanCapture {
+    fn on_new_span(
+        &self,
+        _attrs: &span::Attributes<'_>,
+        id: &span::Id,
+        ctx: LayerContext<'_, S>,
+    ) {
+        if let Some(s) = ctx.span(id) {
+            if s.name() == "prove" {
+                s.extensions_mut().insert(SpanStart(Instant::now()));
+            }
+        }
+    }
+
+    fn on_close(&self, id: span::Id, ctx: LayerContext<'_, S>) {
+        if let Some(s) = ctx.span(&id) {
+            if s.name() == "prove" {
+                if let Some(start) = s.extensions().get::<SpanStart>() {
+                    self.times
+                        .lock()
+                        .unwrap()
+                        .push(start.0.elapsed().as_micros());
+                }
+            }
+        }
+    }
+}
+
+/// Initialise the global tracing subscriber exactly once and return a handle to
+/// the shared prove-span timing buffer. Thread-safe; safe to call repeatedly
+/// (subsequent calls return the same Arc without re-initialising).
+fn init_tracing_once() -> Arc<Mutex<Vec<u128>>> {
+    static PROVE_TIMES: OnceLock<Arc<Mutex<Vec<u128>>>> = OnceLock::new();
+    PROVE_TIMES
+        .get_or_init(|| {
+            let times: Arc<Mutex<Vec<u128>>> = Arc::new(Mutex::new(Vec::new()));
+            let capture = ProveSpanCapture { times: Arc::clone(&times) };
+
+            let filter = EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info"));
+
+            let _ = Registry::default()
+                .with(filter)
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .compact()
+                        .with_span_events(FmtSpan::CLOSE),
+                )
+                .with(capture)
+                .try_init();
+
+            times
+        })
+        .clone()
+}
+
+// ── Proof mode ────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SyntheticProofMode {
@@ -184,6 +287,8 @@ async fn prove_synthetic_update<P: Prover>(
     }
 }
 
+// ── Output helpers ────────────────────────────────────────────────────────────
+
 fn expected_outputs<S: ConsensusSpec>(
     spec: SyntheticBenchmarkSpec,
     mode: BenchmarkMode,
@@ -214,6 +319,7 @@ fn decode_public_values(proof: &SP1ProofWithPublicValues) -> Result<SyntheticPro
         .context("failed to decode synthetic proof public values")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_csv(
     path: &Path,
     spec_name: &str,
@@ -229,6 +335,10 @@ fn append_csv(
     verify_avg_us: f64,
     public_values: &SyntheticProofOutputs,
     proof_bytes: usize,
+    total_instructions: u64,
+    gas: u64,
+    execute_us: u128,
+    sp1_prove_span_avg_us: f64,
 ) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         create_dir_all(parent)?;
@@ -244,6 +354,7 @@ fn append_csv(
             "effective_signers_per_update", "committee_transitions", "runs",
             "fixture_us", "setup_us", "prove_avg_us", "verify_avg_us",
             "prev_head", "new_head", "updates_processed", "proof_bytes",
+            "total_instructions", "gas", "execute_us", "sp1_prove_span_avg_us",
         ])?;
     }
 
@@ -265,6 +376,10 @@ fn append_csv(
         public_values.new_head.to_string(),
         public_values.updates_processed.to_string(),
         proof_bytes.to_string(),
+        total_instructions.to_string(),
+        gas.to_string(),
+        execute_us.to_string(),
+        format!("{sp1_prove_span_avg_us:.2}"),
     ])?;
     wtr.flush()?;
 
