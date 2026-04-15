@@ -67,7 +67,7 @@ pub async fn run(args: &BenchmarkArgs<'_>) -> Result<()> {
 }
 
 async fn run_for_spec<S: BenchmarkSpecBinding>(args: &BenchmarkArgs<'_>) -> Result<()> {
-    let prove_span_times = init_tracing_once();
+    let span_timings = init_tracing_once();
 
     let effective_signers =
         benchmark_signers_per_update(args.mode, args.spec_name, args.signers_per_update);
@@ -103,7 +103,7 @@ async fn run_for_spec<S: BenchmarkSpecBinding>(args: &BenchmarkArgs<'_>) -> Resu
     let proof_mode = selected_proof_mode();
 
     // Deterministic execution metrics via execute() — no proof generation, fast.
-    // Placed outside the prove timing loop so it never contaminates wall-clock measurements.
+    // Placed outside the prove timing loop so it never contaminates measurements.
     let execute_started = Instant::now();
     let mut exec_stdin = SP1Stdin::new();
     exec_stdin.write_slice(&encoded_inputs);
@@ -115,26 +115,28 @@ async fn run_for_spec<S: BenchmarkSpecBinding>(args: &BenchmarkArgs<'_>) -> Resu
     let total_instructions = exec_report.total_instruction_count();
     let gas = exec_report.gas().unwrap_or(0);
 
-    let mut prove_times = Vec::with_capacity(args.runs);
-    let mut last_proof = None;
-
     // Clear any span timings that may have accumulated before the timed loop.
-    prove_span_times.lock().unwrap().clear();
+    {
+        let mut t = span_timings.lock().unwrap();
+        t.prove.clear();
+        t.plonk.clear();
+        t.wrap.clear();
+    }
 
+    let mut last_proof = None;
     for _ in 0..args.runs {
         let mut stdin = SP1Stdin::new();
         stdin.write_slice(&encoded_inputs);
-
-        let prove_started = Instant::now();
         let proof = prove_synthetic_update(&client, &pk, stdin, proof_mode)
             .await
             .context("synthetic update proof failed")?;
-        prove_times.push(prove_started.elapsed().as_micros());
         last_proof = Some(proof);
     }
 
-    let sp1_span_vec: Vec<u128> = prove_span_times.lock().unwrap().clone();
-    let sp1_prove_span_avg_us = avg(&sp1_span_vec);
+    let timings = span_timings.lock().unwrap().clone();
+    let prove_avg_us = avg(&timings.prove);
+    let plonk_span_avg_us = avg(&timings.plonk);
+    let wrap_span_avg_us = avg(&timings.wrap);
 
     let proof = last_proof.expect("runs must be greater than zero");
     let public_values = decode_public_values(&proof)?;
@@ -156,11 +158,33 @@ async fn run_for_spec<S: BenchmarkSpecBinding>(args: &BenchmarkArgs<'_>) -> Resu
         verify_times.resize(args.runs, 0);
     }
 
-    // .bytes() is only valid for Plonk/Groth16 proofs; Core (mock) proofs have no onchain encoding.
-    let proof_bytes = if proof_mode.requires_verification() {
+    // .bytes() is only valid for Plonk/Groth16 proofs.
+    let proof_bytes = if proof_mode.requires_plonk_bytes() {
         proof.bytes().len()
     } else {
         0
+    };
+
+    // Compressed proof metrics — run ONE compressed prove outside the timed loop
+    // to get pre-PLONK proof size and verify time without polluting prove timing.
+    let (compressed_proof_bytes, compressed_verify_us) = if proof_mode == SyntheticProofMode::Plonk
+    {
+        let mut stdin = SP1Stdin::new();
+        stdin.write_slice(&encoded_inputs);
+        let compressed =
+            prove_synthetic_update(&client, &pk, stdin, SyntheticProofMode::Compressed)
+                .await
+                .context("compressed proof failed")?;
+        let size = bincode::serialized_size(&compressed)
+            .context("serialized_size on compressed proof failed")? as usize;
+        let v_start = Instant::now();
+        client
+            .verify(&compressed, pk.verifying_key(), None)
+            .context("compressed proof verification failed")?;
+        let v_us = v_start.elapsed().as_micros() as f64;
+        (size, v_us)
+    } else {
+        (0, 0.0)
     };
 
     append_csv(
@@ -174,14 +198,17 @@ async fn run_for_spec<S: BenchmarkSpecBinding>(args: &BenchmarkArgs<'_>) -> Resu
         args.runs,
         fixture_elapsed.as_micros(),
         setup_elapsed.as_micros(),
-        avg(&prove_times),
+        prove_avg_us,
         avg(&verify_times),
         &public_values,
         proof_bytes,
         total_instructions,
         gas,
         execute_elapsed.as_micros(),
-        sp1_prove_span_avg_us,
+        compressed_proof_bytes,
+        compressed_verify_us,
+        plonk_span_avg_us,
+        wrap_span_avg_us,
     )?;
 
     Ok(())
@@ -192,10 +219,19 @@ async fn run_for_spec<S: BenchmarkSpecBinding>(args: &BenchmarkArgs<'_>) -> Resu
 /// Marker stored in span extensions to record the wall-clock start time.
 struct SpanStart(Instant);
 
-/// Tracing layer that records the wall-clock duration of SP1's internal `prove`
-/// span into a shared Vec. One entry is pushed per `prove()` call.
+/// Per-call timing buffers for the three SP1 spans we care about.
+#[derive(Clone, Default)]
+struct SpanTimings {
+    prove: Vec<u128>,
+    plonk: Vec<u128>,
+    wrap: Vec<u128>,
+}
+
+/// Tracing layer that records wall-clock durations of SP1's internal `prove`,
+/// `prove plonk`, and `prove wrap` spans. One entry per call is pushed into the
+/// matching buffer; the buffers are averaged after the timed loop.
 struct ProveSpanCapture {
-    times: Arc<Mutex<Vec<u128>>>,
+    timings: Arc<Mutex<SpanTimings>>,
 }
 
 impl<S: tracing::Subscriber + for<'a> LookupSpan<'a>> Layer<S> for ProveSpanCapture {
@@ -206,20 +242,25 @@ impl<S: tracing::Subscriber + for<'a> LookupSpan<'a>> Layer<S> for ProveSpanCapt
         ctx: LayerContext<'_, S>,
     ) {
         if let Some(s) = ctx.span(id) {
-            if s.name() == "prove" {
-                s.extensions_mut().insert(SpanStart(Instant::now()));
+            match s.name() {
+                "prove" | "prove plonk" | "prove wrap" => {
+                    s.extensions_mut().insert(SpanStart(Instant::now()));
+                }
+                _ => {}
             }
         }
     }
 
     fn on_close(&self, id: span::Id, ctx: LayerContext<'_, S>) {
         if let Some(s) = ctx.span(&id) {
-            if s.name() == "prove" {
-                if let Some(start) = s.extensions().get::<SpanStart>() {
-                    self.times
-                        .lock()
-                        .unwrap()
-                        .push(start.0.elapsed().as_micros());
+            if let Some(start) = s.extensions().get::<SpanStart>() {
+                let elapsed = start.0.elapsed().as_micros();
+                let mut t = self.timings.lock().unwrap();
+                match s.name() {
+                    "prove" => t.prove.push(elapsed),
+                    "prove plonk" => t.plonk.push(elapsed),
+                    "prove wrap" => t.wrap.push(elapsed),
+                    _ => {}
                 }
             }
         }
@@ -227,14 +268,13 @@ impl<S: tracing::Subscriber + for<'a> LookupSpan<'a>> Layer<S> for ProveSpanCapt
 }
 
 /// Initialise the global tracing subscriber exactly once and return a handle to
-/// the shared prove-span timing buffer. Thread-safe; safe to call repeatedly
-/// (subsequent calls return the same Arc without re-initialising).
-fn init_tracing_once() -> Arc<Mutex<Vec<u128>>> {
-    static PROVE_TIMES: OnceLock<Arc<Mutex<Vec<u128>>>> = OnceLock::new();
-    PROVE_TIMES
+/// the shared span-timing buffers. Thread-safe; safe to call repeatedly.
+fn init_tracing_once() -> Arc<Mutex<SpanTimings>> {
+    static TIMINGS: OnceLock<Arc<Mutex<SpanTimings>>> = OnceLock::new();
+    TIMINGS
         .get_or_init(|| {
-            let times: Arc<Mutex<Vec<u128>>> = Arc::new(Mutex::new(Vec::new()));
-            let capture = ProveSpanCapture { times: Arc::clone(&times) };
+            let timings: Arc<Mutex<SpanTimings>> = Arc::new(Mutex::new(SpanTimings::default()));
+            let capture = ProveSpanCapture { timings: Arc::clone(&timings) };
 
             let filter = EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| EnvFilter::new("info"));
@@ -249,7 +289,7 @@ fn init_tracing_once() -> Arc<Mutex<Vec<u128>>> {
                 .with(capture)
                 .try_init();
 
-            times
+            timings
         })
         .clone()
 }
@@ -259,11 +299,18 @@ fn init_tracing_once() -> Arc<Mutex<Vec<u128>>> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SyntheticProofMode {
     Core,
+    Compressed,
     Plonk,
 }
 
 impl SyntheticProofMode {
+    /// Whether the mode supports verification via `client.verify()`.
     fn requires_verification(self) -> bool {
+        matches!(self, Self::Compressed | Self::Plonk)
+    }
+
+    /// Whether `.bytes()` is valid for the resulting proof (Plonk only).
+    fn requires_plonk_bytes(self) -> bool {
         matches!(self, Self::Plonk)
     }
 }
@@ -283,6 +330,7 @@ async fn prove_synthetic_update<P: Prover>(
 ) -> Result<SP1ProofWithPublicValues, P::Error> {
     match proof_mode {
         SyntheticProofMode::Core => client.prove(pk, stdin).core().await,
+        SyntheticProofMode::Compressed => client.prove(pk, stdin).compressed().await,
         SyntheticProofMode::Plonk => client.prove(pk, stdin).plonk().await,
     }
 }
@@ -338,7 +386,10 @@ fn append_csv(
     total_instructions: u64,
     gas: u64,
     execute_us: u128,
-    sp1_prove_span_avg_us: f64,
+    compressed_proof_bytes: usize,
+    compressed_verify_us: f64,
+    plonk_span_avg_us: f64,
+    wrap_span_avg_us: f64,
 ) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         create_dir_all(parent)?;
@@ -354,7 +405,9 @@ fn append_csv(
             "effective_signers_per_update", "committee_transitions", "runs",
             "fixture_us", "setup_us", "prove_avg_us", "verify_avg_us",
             "prev_head", "new_head", "updates_processed", "proof_bytes",
-            "total_instructions", "gas", "execute_us", "sp1_prove_span_avg_us",
+            "total_instructions", "gas", "execute_us",
+            "compressed_proof_bytes", "compressed_verify_us",
+            "plonk_span_avg_us", "wrap_span_avg_us",
         ])?;
     }
 
@@ -379,7 +432,10 @@ fn append_csv(
         total_instructions.to_string(),
         gas.to_string(),
         execute_us.to_string(),
-        format!("{sp1_prove_span_avg_us:.2}"),
+        compressed_proof_bytes.to_string(),
+        format!("{compressed_verify_us:.2}"),
+        format!("{plonk_span_avg_us:.2}"),
+        format!("{wrap_span_avg_us:.2}"),
     ])?;
     wtr.flush()?;
 

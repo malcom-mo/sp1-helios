@@ -7976,6 +7976,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-trie",
  "anyhow",
+ "bincode",
  "cargo_metadata",
  "clap",
  "csv",
