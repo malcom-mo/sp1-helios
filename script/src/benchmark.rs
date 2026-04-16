@@ -123,8 +123,9 @@ async fn run_for_spec<S: BenchmarkSpecBinding>(args: &BenchmarkArgs<'_>) -> Resu
         t.wrap.clear();
     }
 
+    // +1 warmup iteration — first result is discarded before averaging.
     let mut last_proof = None;
-    for _ in 0..args.runs {
+    for _ in 0..args.runs + 1 {
         let mut stdin = SP1Stdin::new();
         stdin.write_slice(&encoded_inputs);
         let proof = prove_synthetic_update(&client, &pk, stdin, proof_mode)
@@ -133,10 +134,20 @@ async fn run_for_spec<S: BenchmarkSpecBinding>(args: &BenchmarkArgs<'_>) -> Resu
         last_proof = Some(proof);
     }
 
-    let timings = span_timings.lock().unwrap().clone();
+    let timings = {
+        let mut t = span_timings.lock().unwrap().clone();
+        // Drop the warmup iteration's span timings (first entry in each buffer).
+        if !t.prove.is_empty() { t.prove.remove(0); }
+        if !t.plonk.is_empty() { t.plonk.remove(0); }
+        if !t.wrap.is_empty() { t.wrap.remove(0); }
+        t
+    };
     let prove_avg_us = avg(&timings.prove);
+    let prove_stddev_us = stddev_u128(&timings.prove, prove_avg_us);
     let plonk_span_avg_us = avg(&timings.plonk);
+    let plonk_span_stddev_us = stddev_u128(&timings.plonk, plonk_span_avg_us);
     let wrap_span_avg_us = avg(&timings.wrap);
+    let wrap_span_stddev_us = stddev_u128(&timings.wrap, wrap_span_avg_us);
 
     let proof = last_proof.expect("runs must be greater than zero");
     let public_values = decode_public_values(&proof)?;
@@ -145,18 +156,22 @@ async fn run_for_spec<S: BenchmarkSpecBinding>(args: &BenchmarkArgs<'_>) -> Resu
         "proof outputs diverged from native benchmark run"
     );
 
+    // +1 warmup iteration for verify too; drop the first sample.
     let mut verify_times = Vec::with_capacity(args.runs);
     if proof_mode.requires_verification() {
-        for _ in 0..args.runs {
+        for _ in 0..args.runs + 1 {
             let verify_started = Instant::now();
             client
                 .verify(&proof, pk.verifying_key(), None)
                 .context("synthetic update proof verification failed")?;
             verify_times.push(verify_started.elapsed().as_micros());
         }
+        verify_times.remove(0);
     } else {
         verify_times.resize(args.runs, 0);
     }
+    let verify_avg_us = avg(&verify_times);
+    let verify_stddev_us = stddev_u128(&verify_times, verify_avg_us);
 
     // .bytes() is only valid for Plonk/Groth16 proofs.
     let proof_bytes = if proof_mode.requires_plonk_bytes() {
@@ -165,27 +180,38 @@ async fn run_for_spec<S: BenchmarkSpecBinding>(args: &BenchmarkArgs<'_>) -> Resu
         0
     };
 
-    // Compressed proof metrics — run ONE compressed prove outside the timed loop
-    // to get pre-PLONK proof size and verify time without polluting prove timing.
-    let (compressed_proof_bytes, compressed_verify_us) = if proof_mode == SyntheticProofMode::Plonk
-    {
-        let mut stdin = SP1Stdin::new();
-        stdin.write_slice(&encoded_inputs);
-        let compressed =
-            prove_synthetic_update(&client, &pk, stdin, SyntheticProofMode::Compressed)
-                .await
-                .context("compressed proof failed")?;
-        let size = bincode::serialized_size(&compressed)
-            .context("serialized_size on compressed proof failed")? as usize;
-        let v_start = Instant::now();
-        client
-            .verify(&compressed, pk.verifying_key(), None)
-            .context("compressed proof verification failed")?;
-        let v_us = v_start.elapsed().as_micros() as f64;
-        (size, v_us)
-    } else {
-        (0, 0.0)
-    };
+    // Compressed proof metrics — run ONE compressed prove to get the pre-PLONK proof
+    // artifact (the SDK doesn't surface the intermediate compressed proof from .plonk()).
+    // Prove time is intentionally not measured here: it is already captured inside the
+    // Plonk span timings above. Verification is averaged over runs+1 iterations (warmup
+    // discarded) on the same proof object to match the Plonk verify methodology.
+    let (compressed_proof_bytes, compressed_verify_avg_us, compressed_verify_stddev_us) =
+        if proof_mode == SyntheticProofMode::Plonk {
+            let mut stdin = SP1Stdin::new();
+            stdin.write_slice(&encoded_inputs);
+            let compressed =
+                prove_synthetic_update(&client, &pk, stdin, SyntheticProofMode::Compressed)
+                    .await
+                    .context("compressed proof failed")?;
+            let size = bincode::serialized_size(&compressed)
+                .context("serialized_size on compressed proof failed")? as usize;
+
+            // +1 warmup; drop first sample.
+            let mut c_verify_times = Vec::with_capacity(args.runs + 1);
+            for _ in 0..args.runs + 1 {
+                let v_start = Instant::now();
+                client
+                    .verify(&compressed, pk.verifying_key(), None)
+                    .context("compressed proof verification failed")?;
+                c_verify_times.push(v_start.elapsed().as_micros());
+            }
+            c_verify_times.remove(0);
+            let avg = avg(&c_verify_times);
+            let sd = stddev_u128(&c_verify_times, avg);
+            (size, avg, sd)
+        } else {
+            (0, 0.0, 0.0)
+        };
 
     append_csv(
         args.output,
@@ -199,16 +225,21 @@ async fn run_for_spec<S: BenchmarkSpecBinding>(args: &BenchmarkArgs<'_>) -> Resu
         fixture_elapsed.as_micros(),
         setup_elapsed.as_micros(),
         prove_avg_us,
-        avg(&verify_times),
+        prove_stddev_us,
+        verify_avg_us,
+        verify_stddev_us,
         &public_values,
         proof_bytes,
         total_instructions,
         gas,
         execute_elapsed.as_micros(),
         compressed_proof_bytes,
-        compressed_verify_us,
+        compressed_verify_avg_us,
+        compressed_verify_stddev_us,
         plonk_span_avg_us,
+        plonk_span_stddev_us,
         wrap_span_avg_us,
+        wrap_span_stddev_us,
     )?;
 
     Ok(())
@@ -380,16 +411,21 @@ fn append_csv(
     fixture_us: u128,
     setup_us: u128,
     prove_avg_us: f64,
+    prove_stddev_us: f64,
     verify_avg_us: f64,
+    verify_stddev_us: f64,
     public_values: &SyntheticProofOutputs,
     proof_bytes: usize,
     total_instructions: u64,
     gas: u64,
     execute_us: u128,
     compressed_proof_bytes: usize,
-    compressed_verify_us: f64,
+    compressed_verify_avg_us: f64,
+    compressed_verify_stddev_us: f64,
     plonk_span_avg_us: f64,
+    plonk_span_stddev_us: f64,
     wrap_span_avg_us: f64,
+    wrap_span_stddev_us: f64,
 ) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         create_dir_all(parent)?;
@@ -403,11 +439,15 @@ fn append_csv(
         wtr.write_record(&[
             "timestamp", "spec", "mode", "committee_size", "initial_slot",
             "effective_signers_per_update", "committee_transitions", "runs",
-            "fixture_us", "setup_us", "prove_avg_us", "verify_avg_us",
+            "fixture_us", "setup_us",
+            "prove_avg_us", "prove_stddev_us",
+            "verify_avg_us", "verify_stddev_us",
             "prev_head", "new_head", "updates_processed", "proof_bytes",
             "total_instructions", "gas", "execute_us",
-            "compressed_proof_bytes", "compressed_verify_us",
-            "plonk_span_avg_us", "wrap_span_avg_us",
+            "compressed_proof_bytes",
+            "compressed_verify_avg_us", "compressed_verify_stddev_us",
+            "plonk_span_avg_us", "plonk_span_stddev_us",
+            "wrap_span_avg_us", "wrap_span_stddev_us",
         ])?;
     }
 
@@ -424,7 +464,9 @@ fn append_csv(
         fixture_us.to_string(),
         setup_us.to_string(),
         format!("{prove_avg_us:.2}"),
+        format!("{prove_stddev_us:.2}"),
         format!("{verify_avg_us:.2}"),
+        format!("{verify_stddev_us:.2}"),
         public_values.prev_head.to_string(),
         public_values.new_head.to_string(),
         public_values.updates_processed.to_string(),
@@ -433,9 +475,12 @@ fn append_csv(
         gas.to_string(),
         execute_us.to_string(),
         compressed_proof_bytes.to_string(),
-        format!("{compressed_verify_us:.2}"),
+        format!("{compressed_verify_avg_us:.2}"),
+        format!("{compressed_verify_stddev_us:.2}"),
         format!("{plonk_span_avg_us:.2}"),
+        format!("{plonk_span_stddev_us:.2}"),
         format!("{wrap_span_avg_us:.2}"),
+        format!("{wrap_span_stddev_us:.2}"),
     ])?;
     wtr.flush()?;
 
@@ -456,6 +501,17 @@ fn avg(values: &[u128]) -> f64 {
     } else {
         values.iter().sum::<u128>() as f64 / values.len() as f64
     }
+}
+
+fn stddev_u128(values: &[u128], mean: f64) -> f64 {
+    if values.len() < 2 {
+        return 0.0;
+    }
+    let variance = values.iter().map(|&v| {
+        let diff = v as f64 - mean;
+        diff * diff
+    }).sum::<f64>() / (values.len() - 1) as f64;
+    variance.sqrt()
 }
 
 pub fn parse_mode(mode: &str) -> BenchmarkMode {
