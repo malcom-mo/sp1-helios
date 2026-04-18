@@ -123,9 +123,8 @@ async fn run_for_spec<S: BenchmarkSpecBinding>(args: &BenchmarkArgs<'_>) -> Resu
         t.wrap.clear();
     }
 
-    // +1 warmup iteration — first result is discarded before averaging.
     let mut last_proof = None;
-    for _ in 0..args.runs + 1 {
+    for _ in 0..args.runs {
         let mut stdin = SP1Stdin::new();
         stdin.write_slice(&encoded_inputs);
         let proof = prove_synthetic_update(&client, &pk, stdin, proof_mode)
@@ -134,14 +133,7 @@ async fn run_for_spec<S: BenchmarkSpecBinding>(args: &BenchmarkArgs<'_>) -> Resu
         last_proof = Some(proof);
     }
 
-    let timings = {
-        let mut t = span_timings.lock().unwrap().clone();
-        // Drop the warmup iteration's span timings (first entry in each buffer).
-        if !t.prove.is_empty() { t.prove.remove(0); }
-        if !t.plonk.is_empty() { t.plonk.remove(0); }
-        if !t.wrap.is_empty() { t.wrap.remove(0); }
-        t
-    };
+    let timings = span_timings.lock().unwrap().clone();
     let prove_avg_us = avg(&timings.prove);
     let prove_stddev_us = stddev_u128(&timings.prove, prove_avg_us);
     let plonk_span_avg_us = avg(&timings.plonk);
@@ -156,17 +148,15 @@ async fn run_for_spec<S: BenchmarkSpecBinding>(args: &BenchmarkArgs<'_>) -> Resu
         "proof outputs diverged from native benchmark run"
     );
 
-    // +1 warmup iteration for verify too; drop the first sample.
     let mut verify_times = Vec::with_capacity(args.runs);
     if proof_mode.requires_verification() {
-        for _ in 0..args.runs + 1 {
+        for _ in 0..args.runs {
             let verify_started = Instant::now();
             client
                 .verify(&proof, pk.verifying_key(), None)
                 .context("synthetic update proof verification failed")?;
             verify_times.push(verify_started.elapsed().as_micros());
         }
-        verify_times.remove(0);
     } else {
         verify_times.resize(args.runs, 0);
     }
@@ -183,8 +173,7 @@ async fn run_for_spec<S: BenchmarkSpecBinding>(args: &BenchmarkArgs<'_>) -> Resu
     // Compressed proof metrics — run ONE compressed prove to get the pre-PLONK proof
     // artifact (the SDK doesn't surface the intermediate compressed proof from .plonk()).
     // Prove time is intentionally not measured here: it is already captured inside the
-    // Plonk span timings above. Verification is averaged over runs+1 iterations (warmup
-    // discarded) on the same proof object to match the Plonk verify methodology.
+    // Plonk span timings above.
     let (compressed_proof_bytes, compressed_verify_avg_us, compressed_verify_stddev_us) =
         if proof_mode == SyntheticProofMode::Plonk {
             let mut stdin = SP1Stdin::new();
@@ -196,16 +185,14 @@ async fn run_for_spec<S: BenchmarkSpecBinding>(args: &BenchmarkArgs<'_>) -> Resu
             let size = bincode::serialized_size(&compressed)
                 .context("serialized_size on compressed proof failed")? as usize;
 
-            // +1 warmup; drop first sample.
-            let mut c_verify_times = Vec::with_capacity(args.runs + 1);
-            for _ in 0..args.runs + 1 {
+            let mut c_verify_times = Vec::with_capacity(args.runs);
+            for _ in 0..args.runs {
                 let v_start = Instant::now();
                 client
                     .verify(&compressed, pk.verifying_key(), None)
                     .context("compressed proof verification failed")?;
                 c_verify_times.push(v_start.elapsed().as_micros());
             }
-            c_verify_times.remove(0);
             let avg = avg(&c_verify_times);
             let sd = stddev_u128(&c_verify_times, avg);
             (size, avg, sd)
